@@ -6,7 +6,7 @@ import { google } from 'googleapis';
 export function createOAuth2Client() {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:5000/api/accounts/google/callback';
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI || 'https://master-drive-backend.onrender.com/api/accounts/google/callback';
 
   return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
 }
