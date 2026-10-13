@@ -1,0 +1,6 @@
+node_modules/
+.env
+.env.local
+.mongo_data/
+.mock_storage/
+*.log
