@@ -1,11 +1,14 @@
 import busboy from 'busboy';
+import crypto from 'crypto';
+import { PassThrough } from 'stream';
 import VirtualItem from '../models/VirtualItem.js';
 import DriveAccount from '../models/DriveAccount.js';
 import { processChunkedUpload } from '../services/chunkEngine.js';
 import { streamReassembledFile } from '../services/streamAssembler.js';
-import { deleteChunk } from '../services/driveService.js';
+import { deleteChunk, uploadChunk } from '../services/driveService.js';
 import { broadcaster } from '../services/eventBroadcaster.js';
 import { ensureFolderPath } from '../services/folderService.js';
+import { getActiveAccounts, pickBestAccount } from '../services/balancerService.js';
 
 /**
  * Builds breadcrumbs hierarchy from current folder up to root
@@ -152,6 +155,8 @@ export async function createFolder(req, res, next) {
  */
 export async function uploadFile(req, res, next) {
   try {
+    req.setTimeout(0);
+    res.setTimeout(0);
     const bb = busboy({ headers: req.headers });
 
     let parentId = req.query.parentId && req.query.parentId !== 'null' ? req.query.parentId : null;
@@ -666,11 +671,190 @@ export async function getPhotoTimeline(req, res, next) {
   }
 }
 
+/**
+ * Initializes a chunked upload session for large files (videos > 8MB).
+ * Prevents PaaS reverse proxy timeouts by breaking transfer into small independent chunk requests.
+ */
+export async function initChunkedUpload(req, res, next) {
+  try {
+    const { filename, mimeType, totalSize, parentId, totalChunks, mediaMetadata } = req.body;
+    if (!filename) {
+      return res.status(400).json({ error: 'Filename is required' });
+    }
+
+    const accounts = await getActiveAccounts(req.user._id);
+    if (!accounts || accounts.length === 0) {
+      return res.status(400).json({
+        error: 'No active Google Drive accounts connected. Please link an account first.',
+      });
+    }
+
+    const totalPoolFree = accounts.reduce((acc, a) => acc + Math.max(0, a.totalQuota - a.usedQuota), 0);
+    const expectedSize = Number(totalSize) || 0;
+    if (expectedSize > 0 && expectedSize > totalPoolFree) {
+      return res.status(507).json({
+        error: `Insufficient storage pool capacity. Required ${expectedSize} bytes, available ${totalPoolFree} bytes.`,
+      });
+    }
+
+    const virtualItem = new VirtualItem({
+      userId: req.user._id,
+      name: filename,
+      type: 'file',
+      parentId: parentId || null,
+      mimeType: mimeType || 'application/octet-stream',
+      status: 'uploading',
+      isChunked: true,
+      totalChunks: Number(totalChunks) || 1,
+      size: expectedSize,
+      chunks: [],
+      mediaMetadata: mediaMetadata || null,
+    });
+    await virtualItem.save();
+
+    res.status(201).json({
+      uploadId: virtualItem._id.toString(),
+      message: 'Chunked upload initialized',
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * Receives an individual small chunk (3-5MB), uploads it directly to Google Drive,
+ * updates quotas and records the chunk in the file manifest.
+ */
+export async function uploadChunkPart(req, res, next) {
+  try {
+    req.setTimeout(0);
+    res.setTimeout(0);
+
+    const bb = busboy({ headers: req.headers });
+    let uploadId = null;
+    let partIndex = null;
+    let chunkPromise = null;
+
+    bb.on('field', (name, val) => {
+      if (name === 'uploadId') uploadId = val.trim();
+      if (name === 'partIndex') partIndex = parseInt(val, 10);
+    });
+
+    bb.on('file', (name, stream) => {
+      chunkPromise = (async () => {
+        const chunks = [];
+        for await (const chunk of stream) {
+          chunks.push(chunk);
+        }
+        return Buffer.concat(chunks);
+      })();
+    });
+
+    bb.on('error', (err) => next(err));
+
+    bb.on('close', async () => {
+      try {
+        if (!uploadId || partIndex === null || isNaN(partIndex) || !chunkPromise) {
+          return res.status(400).json({ error: 'Missing uploadId, partIndex, or chunk payload' });
+        }
+
+        const buffer = await chunkPromise;
+        const virtualItem = await VirtualItem.findOne({ _id: uploadId, userId: req.user._id });
+        if (!virtualItem) {
+          return res.status(404).json({ error: 'Upload session not found' });
+        }
+
+        const accounts = await getActiveAccounts(req.user._id);
+        if (!accounts || accounts.length === 0) {
+          return res.status(400).json({ error: 'No active Google Drive accounts available' });
+        }
+
+        const targetAccount = pickBestAccount(accounts, buffer.length, partIndex);
+        const chunkName = `_chk_${virtualItem._id}_part_${partIndex}.bin`;
+        const chunkHash = crypto.createHash('md5').update(buffer).digest('hex');
+
+        const passThrough = new PassThrough();
+        passThrough.end(buffer);
+
+        const uploadResult = await uploadChunk(targetAccount, passThrough, chunkName);
+
+        const partInfo = {
+          partIndex,
+          driveAccountId: targetAccount._id,
+          googleDriveFileId: uploadResult.id,
+          size: buffer.length,
+          md5: uploadResult.md5 || chunkHash,
+        };
+
+        // Replace existing part if retried
+        virtualItem.chunks = virtualItem.chunks.filter((c) => c.partIndex !== partIndex);
+        virtualItem.chunks.push(partInfo);
+        await virtualItem.save();
+
+        // Increment quota
+        await DriveAccount.findByIdAndUpdate(targetAccount._id, {
+          $inc: { usedQuota: buffer.length },
+        });
+
+        res.json({
+          message: 'Chunk uploaded successfully',
+          partIndex,
+          receivedSize: buffer.length,
+          totalChunksRecorded: virtualItem.chunks.length,
+        });
+      } catch (err) {
+        next(err);
+      }
+    });
+
+    req.pipe(bb);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * Finalizes the chunked upload session, sets status to ready, and notifies clients via SSE.
+ */
+export async function completeChunkedUpload(req, res, next) {
+  try {
+    const { uploadId } = req.body;
+    if (!uploadId) {
+      return res.status(400).json({ error: 'uploadId is required' });
+    }
+
+    const virtualItem = await VirtualItem.findOne({ _id: uploadId, userId: req.user._id });
+    if (!virtualItem) {
+      return res.status(404).json({ error: 'Upload session not found' });
+    }
+
+    virtualItem.chunks.sort((a, b) => a.partIndex - b.partIndex);
+    const actualSize = virtualItem.chunks.reduce((sum, c) => sum + c.size, 0);
+    virtualItem.size = actualSize;
+    virtualItem.totalChunks = virtualItem.chunks.length;
+    virtualItem.status = 'ready';
+    await virtualItem.save();
+
+    broadcaster.broadcast(req.user._id, 'file:created', { file: virtualItem });
+    broadcaster.broadcast(req.user._id, 'storage:updated', { reason: 'upload_complete' });
+
+    res.json({
+      message: 'File upload completed and striped across pool',
+      file: virtualItem,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export default {
   subscribeEvents,
   getFiles,
   createFolder,
   uploadFile,
+  initChunkedUpload,
+  uploadChunkPart,
+  completeChunkedUpload,
   downloadFile,
   previewFile,
   updateItem,
