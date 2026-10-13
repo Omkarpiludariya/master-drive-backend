@@ -4,6 +4,9 @@ import {
   getFiles,
   createFolder,
   uploadFile,
+  initChunkedUpload,
+  uploadChunkPart,
+  completeChunkedUpload,
   downloadFile,
   previewFile,
   updateItem,
@@ -45,6 +48,9 @@ router.post('/ensure-folder-path', async (req, res, next) => {
 router.get('/', getFiles);
 router.post('/folders', createFolder);
 router.post('/upload', uploadFile);
+router.post('/upload/init', initChunkedUpload);
+router.post('/upload/chunk', uploadChunkPart);
+router.post('/upload/complete', completeChunkedUpload);
 
 // Streaming download and inline preview
 router.get('/:id/download', downloadFile);

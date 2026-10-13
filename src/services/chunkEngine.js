@@ -6,8 +6,8 @@ import VirtualItem from '../models/VirtualItem.js';
 import { uploadChunk, deleteChunk } from './driveService.js';
 import { getActiveAccounts, pickBestAccount } from './balancerService.js';
 
-const DEFAULT_CHUNK_SIZE = (parseInt(process.env.DEFAULT_CHUNK_SIZE_MB, 10) || 15) * 1024 * 1024;
-const DEFAULT_CONCURRENCY = Math.max(1, parseInt(process.env.UPLOAD_CONCURRENCY, 10) || 2);
+const DEFAULT_CHUNK_SIZE = (parseInt(process.env.DEFAULT_CHUNK_SIZE_MB, 10) || 8) * 1024 * 1024;
+const DEFAULT_CONCURRENCY = Math.max(1, parseInt(process.env.UPLOAD_CONCURRENCY, 10) || 1);
 
 /**
  * Rolls back uploaded chunks upon failure to prevent orphaned cloud storage
